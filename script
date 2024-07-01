@@ -1,0 +1,169 @@
+//@version=5
+strategy("Envelope Strategy Hull RR 3min EURUSD-USDCAD-EURCAD ", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=100, initial_capital=100000, pyramiding = 20, commission_type=strategy.commission.percent, commission_value=0.0)
+
+// CopyRight Crypto Robot
+src = input(ohlc4, title="Source", group = "Base MA")
+ma_base_window = input.int(90, "Base Moving Average Window", step = 1, group = "Base MA")
+ma_type = input.string(defval='8. AVG', options=['1. SMA', '2. PCMA', '3. EMA', '4. WMA', '5. DEMA', '6. ZLEMA', '7. HMA', '8. AVG', '9. DC'], title='MA Type', group = "Base MA")
+hull_length = input.int(309, "Hull Moving Average Window", step = 1, group = "Base MA")
+envelope_value = input.float(18, "Envelope in pips", step = 1, group = "Base MA") / 100
+use_longs = input.bool(true, 'Long Positions', group="position") 
+use_short = input.bool(true, 'Short Positions', group="position")
+leverage= input.float(0.8, 'Leverage', step = 0.1, group="position")
+// Input for the interval in hours
+interval_hours = input.int(defval=3, title="Hours Order interval", minval=1, group="position")
+max_open_trades = input.int(defval=60, title="Max Open Trades", minval=1, group="position")
+skip_trades = input.int(defval=1, title="Skip Trades", minval=0, group="position")
+
+is_martingal= input.bool(true, 'Use martingal', group="martingal")
+multiplier= input.float(1.2, 'Multiplier', step = 0.1, group="martingal")
+
+
+use_mirror = input.bool(true, "Use Miror trades ?", group="mirror")
+mirror_order_multiplier = input.int(defval=3, title="Mirror Order Multiplier", minval=1, group="mirror")
+
+use_period = input.bool(false, "filter by Periode?", group="periode")
+startDate = input.time(timestamp("01 Jan 2020"), "Date de début", group="periode")
+endDate = input.time(timestamp("01 Jan 2025"), "Date de fin", group="periode")
+
+use_env_plot = input.bool(false, "Plot envelope indicator ?", group="ploting")
+use_base_plot = input.bool(false, "Plot base ma indicator ?", group="ploting")
+
+
+//----
+signa=0.,signb=0.,diff = math.abs(ta.change(src))
+a=0.,a := math.max(src,nz(a[1],src)) - math.min(math.abs(src-nz(a[1],src)),diff)/ma_base_window*nz(signa[1])
+b=0.,b := math.min(src,nz(b[1],src)) + math.min(math.abs(src-nz(b[1],src)),diff)/ma_base_window*nz(signb[1])
+signa := b < b[1] ? -1 * 1 : 1 
+signb := a > a[1] ? -1 * 1 : 1
+lowera =  ta.lowest(ma_base_window)
+upperb =  ta.highest(ma_base_window)
+basis =  math.avg(upperb, lowera)
+
+
+// ---------------------------------------------
+// -------------- INDICATORS -------------------
+ma_function(MA_type, MA_length) =>
+    zlema_lag = (MA_length - 1) / 2
+    hma_src = MA_type == '7. HMA' ? 2 * ta.wma(src, math.floor(MA_length / 2)) - ta.wma(src, MA_length) : na
+    MA_type == '1. SMA' ? ta.sma(src, MA_length) : MA_type == '2. PCMA' ? (ta.highest(high, MA_length) + ta.lowest(low, MA_length)) / 2 : MA_type == '3. EMA' ? ta.ema(src, MA_length) : MA_type == '4. WMA' ? ta.wma(src, MA_length) : MA_type == '5. DEMA' ? 2 * ta.ema(src, MA_length) - ta.ema(ta.ema(src, MA_length), MA_length) : MA_type == '6. ZLEMA' ? ta.ema(src + src - src[zlema_lag], MA_length) : MA_type == '7. HMA' ? ta.wma(hma_src, math.floor(math.sqrt(MA_length))) : MA_type == '8. AVG' ? math.avg(a,b) :  MA_type == '9. DC' ? math.avg(upperb, lowera) : na
+
+ma_base = ma_function(ma_type, ma_base_window)
+
+// Calcul des moyennes mobiles
+hull = ta.wma(2 * ta.wma(close, hull_length / 2) - ta.wma(close, hull_length), math.round(math.sqrt(hull_length)))
+
+// Variables pour gérer les positions
+var percent_value = envelope_value / 100
+var float long_entry_price = ma_base - ma_base * percent_value * close
+var float short_entry_price = ma_base + ma_base * percent_value * close
+var float current_multiplier = multiplier
+// Calculate the interval in milliseconds
+interval_ms = interval_hours * 60 * 60 * 1000
+
+// Variable to store the last order time
+var int last_order_time = 0
+var int orderNumber = 0
+
+// Function to calculate drawdown
+var float peak = na
+var float trough = na
+var float maxDD = 0.0
+var LicenseID = '7504150593749'
+
+if strategy.opentrades == 0
+    long_entry_price := ma_base - (percent_value * close + percent_value * close * skip_trades)
+    short_entry_price := ma_base + (percent_value * close + percent_value * close * skip_trades)
+
+inDateRange = use_period ? ((time >= startDate) and (time < endDate)) : true
+
+f_stringContains(src, substr) =>
+    len = str.length(src)
+    sublen = str.length(substr)
+    result = false
+    for i = 0 to len - sublen
+        if str.substring(src, i, i + sublen) == substr
+            result := true
+            break
+    result
+
+// Function to check if the interval has passed
+check_time_interval() =>
+    // Check if the interval has passed since the last order
+    (time(timeframe.period) - last_order_time) > interval_ms
+
+hours_passed() => 
+    (time(timeframe.period) - last_order_time) / 60 / 60 / 1000
+
+
+// Conditions d'entrée en position longue
+long_condition = close > hull and close < long_entry_price
+if (long_condition and use_longs and inDateRange and check_time_interval() and orderNumber < max_open_trades)
+    quantity = is_martingal ? (strategy.equity / close) * current_multiplier : (strategy.equity / close)
+    if (close < ma_base ) 
+        strategy.entry("Long_" + str.tostring(orderNumber), strategy.long, qty=quantity*leverage)
+        strategy.exit("Close_" + str.tostring(orderNumber), "Long_" + str.tostring(orderNumber), stop=close-(ma_base-close))
+        alert(LicenseID+',buy,' + syminfo.ticker + ',sl=' +str.tostring(close-(ma_base-close))+ ',risk='+str.tostring(quantity*leverage), alert.freq_once_per_bar_close)
+        orderNumber := orderNumber + 1
+    if use_mirror
+        if (close > ma_base) 
+            strategy.entry("Long_" + str.tostring(orderNumber), strategy.short, qty=quantity*leverage)
+            strategy.exit("Close_" + str.tostring(orderNumber), "Long_" + str.tostring(orderNumber), stop=close-(ma_base-close))
+            alert(LicenseID+',buy,' + syminfo.ticker + ',sl=' +str.tostring(close-(ma_base-close))+ ',risk='+str.tostring(quantity*leverage), alert.freq_once_per_bar_close)
+            orderNumber := orderNumber + 1
+    short_entry_price := close + (percent_value * close) * mirror_order_multiplier
+    long_entry_price := close - percent_value * close
+    current_multiplier := current_multiplier + multiplier
+    last_order_time := time(timeframe.period)
+
+// Conditions d'entrée en position courte
+short_condition = close < hull and close > short_entry_price
+if (short_condition and use_short and inDateRange and check_time_interval() and orderNumber < max_open_trades)
+    quantity = is_martingal ? (strategy.equity / close) * current_multiplier : (strategy.equity / close)
+    if (close > ma_base) 
+        strategy.entry("Short_" + str.tostring(orderNumber), strategy.short, qty=quantity*leverage)
+        strategy.exit("Close_" + str.tostring(orderNumber), "Short_" + str.tostring(orderNumber), stop=close+(close-ma_base))
+        alert(LicenseID+',sell,' + syminfo.ticker + ',sl=' +str.tostring(close+(close-ma_base))+ ',risk='+str.tostring(quantity*leverage), alert.freq_once_per_bar_close)
+        orderNumber := orderNumber + 1
+    if use_mirror
+        if (close < ma_base)
+            strategy.entry("Short_" + str.tostring(orderNumber), strategy.long, qty=quantity*leverage)
+            strategy.exit("Close_" + str.tostring(orderNumber), "Short_" + str.tostring(orderNumber), stop=close+(close-ma_base))
+            alert(LicenseID+',sell,' + syminfo.ticker + ',sl=' +str.tostring(close+(close-ma_base))+ ',risk='+str.tostring(quantity*leverage), alert.freq_once_per_bar_close)
+            orderNumber := orderNumber + 1
+        long_entry_price := close - (percent_value * close) * mirror_order_multiplier
+    short_entry_price := close + percent_value * close
+    current_multiplier := current_multiplier * multiplier
+    last_order_time := time(timeframe.period)
+
+// Condition de sortie pour les positions longues
+close_base_long_condition = high > ma_base
+close_hull_long_condition = close < hull
+
+if ((strategy.position_size > 0 and close_base_long_condition and close_hull_long_condition) or (strategy.position_size > 0 and ta.crossunder(close, ma_base)))
+    strategy.close_all()
+    alert(LicenseID+',closeall,'+syminfo.ticker)
+    long_entry_price := ma_base - percent_value * close
+    current_multiplier := multiplier
+    orderNumber := 0
+
+// Condition de sortie pour les positions courtes
+close_base_short_condition = low < ma_base
+close_hull_short_condition = close > hull
+
+if ((strategy.position_size < 0 and close_base_short_condition and close_hull_short_condition) or (strategy.position_size < 0 and ta.crossover(close, ma_base)))
+    strategy.close_all()
+    alert(LicenseID+',closeall,'+syminfo.ticker)
+    short_entry_price := ma_base + percent_value * close
+    current_multiplier := multiplier
+    orderNumber := 0
+
+
+// Plot entry prices
+plot(use_env_plot ? long_entry_price : na, title="Long Entry Price", color=color.green, linewidth=2)
+plot(use_env_plot ? short_entry_price : na, title="Short Entry Price", color=color.red, linewidth=2)
+
+// Tracer les moyennes mobiles
+plot(use_base_plot ? hull : na, color=color.purple, linewidth=2, title="Hull 309")
+plot(use_base_plot ? ma_base : na, color=color.orange, linewidth=2, title="Hull 309")
+
