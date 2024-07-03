@@ -1,5 +1,5 @@
 //@version=5
-strategy("Envelope Strategy Hull RR 3min EURUSD-USDCAD-EURCAD ", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=100, initial_capital=100000, pyramiding = 20, commission_type=strategy.commission.percent, commission_value=0.0)
+strategy("Envelope Strategy Hull RR 3min EURUSD", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=100, initial_capital=100000, pyramiding = 20, commission_type=strategy.commission.percent, commission_value=0.0)
 
 // CopyRight Crypto Robot
 src = input(ohlc4, title="Source", group = "Base MA")
@@ -7,28 +7,37 @@ ma_base_window = input.int(90, "Base Moving Average Window", step = 1, group = "
 ma_type = input.string(defval='8. AVG', options=['1. SMA', '2. PCMA', '3. EMA', '4. WMA', '5. DEMA', '6. ZLEMA', '7. HMA', '8. AVG', '9. DC'], title='MA Type', group = "Base MA")
 hull_length = input.int(309, "Hull Moving Average Window", step = 1, group = "Base MA")
 envelope_value = input.float(18, "Envelope in pips", step = 1, group = "Base MA") / 100
+
 use_longs = input.bool(true, 'Long Positions', group="position") 
 use_short = input.bool(true, 'Short Positions', group="position")
-leverage= input.float(0.8, 'Leverage', step = 0.1, group="position")
-// Input for the interval in hours
-interval_hours = input.int(defval=3, title="Hours Order interval", minval=1, group="position")
-max_open_trades = input.int(defval=60, title="Max Open Trades", minval=1, group="position")
-skip_trades = input.int(defval=1, title="Skip Trades", minval=0, group="position")
 
-is_martingal= input.bool(true, 'Use martingal', group="martingal")
-multiplier= input.float(1.2, 'Multiplier', step = 0.1, group="martingal")
+use_stoploss = input.bool(true, 'Stop Loss', group="StopLoss")
+ratio = input.float(defval=0.5, title="Risk/Reword ratio", minval=0.1, step = 0.1, group="StopLoss")
+use_fixed_stop = input.bool(false, 'Use Fixed Stop Loss', group="StopLoss")
+fixed_stop = input.float(defval=0.4, title="Fixed stop loss", minval=0, step = 0.01, group="StopLoss")
+
+interval_hours = input.int(defval=3, title="Hours Order interval", minval=1, group="filter")
+max_open_trades = input.int(defval=60, title="Max Open Trades", minval=1, group="filter")
+skip_trades = input.int(defval=1, title="Skip Trades", minval=0, group="filter")
+
+leverage= input.float(0.8, 'Init Position', step = 0.1, group="leverage")
+is_martingal= input.bool(true, 'Use martingal', group="leverage")
+multiplier= input.float(1.2, 'Multiplier', step = 0.1, group="leverage")
 
 
 use_mirror = input.bool(true, "Use Miror trades ?", group="mirror")
+use_mirror_stoploss = input.bool(true, 'Use Mirror Stop Loss', group="mirror")
 mirror_order_multiplier = input.int(defval=3, title="Mirror Order Multiplier", minval=1, group="mirror")
 
 use_period = input.bool(false, "filter by Periode?", group="periode")
 startDate = input.time(timestamp("01 Jan 2020"), "Date de début", group="periode")
 endDate = input.time(timestamp("01 Jan 2025"), "Date de fin", group="periode")
 
-use_env_plot = input.bool(false, "Plot envelope indicator ?", group="ploting")
-use_base_plot = input.bool(false, "Plot base ma indicator ?", group="ploting")
+use_env_plot = input.bool(true, "Plot envelope indicator ?", group="ploting")
+use_base_plot = input.bool(true, "Plot base ma indicator ?", group="ploting")
+use_stop_plot = input.bool(true, "Plot StopLoass indicator ?", group="ploting")
 
+LicenseID = input.string(defval='7504150593749', title="License ID", group="WebHook")
 
 //----
 signa=0.,signb=0.,diff = math.abs(ta.change(src))
@@ -39,7 +48,6 @@ signb := a > a[1] ? -1 * 1 : 1
 lowera =  ta.lowest(ma_base_window)
 upperb =  ta.highest(ma_base_window)
 basis =  math.avg(upperb, lowera)
-
 
 // ---------------------------------------------
 // -------------- INDICATORS -------------------
@@ -52,6 +60,15 @@ ma_base = ma_function(ma_type, ma_base_window)
 
 // Calcul des moyennes mobiles
 hull = ta.wma(2 * ta.wma(close, hull_length / 2) - ta.wma(close, hull_length), math.round(math.sqrt(hull_length)))
+
+balance = strategy.initial_capital + strategy.netprofit
+
+// Function to calculate stop loss percentage
+calculate_stop_loss_percentage(_balance, _quantity, _entry_price, _stop_loss_price) =>
+    loss_per_asset = _entry_price - _stop_loss_price  // Loss per asset if stop loss is hit
+    total_loss = loss_per_asset * _quantity  // Total loss for the quantity
+    loss_percentage = (total_loss / _balance) * 100  // Calculate loss as a percentage of the balance
+    math.round(loss_percentage, 2)
 
 // Variables pour gérer les positions
 var percent_value = envelope_value / 100
@@ -69,7 +86,10 @@ var int orderNumber = 0
 var float peak = na
 var float trough = na
 var float maxDD = 0.0
-var LicenseID = '7504150593749'
+var float buyStopLoss = na
+var float sellStopLoss = na
+var string buyAlert = 'buy'
+var string sellAlert = 'sell'
 
 if strategy.opentrades == 0
     long_entry_price := ma_base - (percent_value * close + percent_value * close * skip_trades)
@@ -95,21 +115,26 @@ check_time_interval() =>
 hours_passed() => 
     (time(timeframe.period) - last_order_time) / 60 / 60 / 1000
 
-
 // Conditions d'entrée en position longue
 long_condition = close > hull and close < long_entry_price
 if (long_condition and use_longs and inDateRange and check_time_interval() and orderNumber < max_open_trades)
     quantity = is_martingal ? (strategy.equity / close) * current_multiplier : (strategy.equity / close)
     if (close < ma_base ) 
+        buyStopLoss := use_fixed_stop ? close - (fixed_stop * close)/100 : close - ((ma_base - close)/ratio)
         strategy.entry("Long_" + str.tostring(orderNumber), strategy.long, qty=quantity*leverage)
-        strategy.exit("Close_" + str.tostring(orderNumber), "Long_" + str.tostring(orderNumber), stop=close-(ma_base-close))
-        alert(LicenseID+',buy,' + syminfo.ticker + ',sl=' +str.tostring(close-(ma_base-close))+ ',risk='+str.tostring(quantity*leverage), alert.freq_once_per_bar_close)
+        risk = calculate_stop_loss_percentage(balance, quantity*leverage, close, buyStopLoss)
+        alert(LicenseID+','+buyAlert+',' + syminfo.ticker + ',price=' + str.tostring(open) + ',sl=' +str.tostring(buyStopLoss)+ ',risk='+str.tostring(risk), alert.freq_once_per_bar_close)
+        if use_stoploss
+            strategy.exit("CloseBuy_" + str.tostring(orderNumber), "Long_" + str.tostring(orderNumber), stop=buyStopLoss)
         orderNumber := orderNumber + 1
     if use_mirror
         if (close > ma_base) 
-            strategy.entry("Long_" + str.tostring(orderNumber), strategy.short, qty=quantity*leverage)
-            strategy.exit("Close_" + str.tostring(orderNumber), "Long_" + str.tostring(orderNumber), stop=close-(ma_base-close))
-            alert(LicenseID+',buy,' + syminfo.ticker + ',sl=' +str.tostring(close-(ma_base-close))+ ',risk='+str.tostring(quantity*leverage), alert.freq_once_per_bar_close)
+            sellStopLoss := use_fixed_stop ? close + (fixed_stop * close)/100 : close + ((close-ma_base)/ratio)
+            strategy.entry("ShortM_" + str.tostring(orderNumber), strategy.short, qty=quantity*leverage)
+            risk = calculate_stop_loss_percentage(balance, quantity*leverage, close, sellStopLoss)
+            alert(LicenseID+','+sellAlert+',' + syminfo.ticker + ',price=' + str.tostring(open) + ',sl=' +str.tostring(sellStopLoss)+ ',risk='+str.tostring(risk), alert.freq_once_per_bar_close)
+            if use_mirror_stoploss
+                strategy.exit("CloseShortM_" + str.tostring(orderNumber), "ShortM_" + str.tostring(orderNumber), stop=sellStopLoss)
             orderNumber := orderNumber + 1
     short_entry_price := close + (percent_value * close) * mirror_order_multiplier
     long_entry_price := close - percent_value * close
@@ -121,15 +146,21 @@ short_condition = close < hull and close > short_entry_price
 if (short_condition and use_short and inDateRange and check_time_interval() and orderNumber < max_open_trades)
     quantity = is_martingal ? (strategy.equity / close) * current_multiplier : (strategy.equity / close)
     if (close > ma_base) 
+        sellStopLoss := use_fixed_stop ? close + (fixed_stop * close)/100 : close + ((close-ma_base)/ratio)
         strategy.entry("Short_" + str.tostring(orderNumber), strategy.short, qty=quantity*leverage)
-        strategy.exit("Close_" + str.tostring(orderNumber), "Short_" + str.tostring(orderNumber), stop=close+(close-ma_base))
-        alert(LicenseID+',sell,' + syminfo.ticker + ',sl=' +str.tostring(close+(close-ma_base))+ ',risk='+str.tostring(quantity*leverage), alert.freq_once_per_bar_close)
+        risk = calculate_stop_loss_percentage(balance, quantity*leverage, close, sellStopLoss)
+        alert(LicenseID+','+sellAlert+',' + syminfo.ticker + ',price=' + str.tostring(open) + ',sl=' +str.tostring(sellStopLoss)+ ',risk='+str.tostring(risk), alert.freq_once_per_bar_close)
+        if use_stoploss
+            strategy.exit("CloseShort_" + str.tostring(orderNumber), "Short_" + str.tostring(orderNumber), stop=sellStopLoss)
         orderNumber := orderNumber + 1
     if use_mirror
         if (close < ma_base)
-            strategy.entry("Short_" + str.tostring(orderNumber), strategy.long, qty=quantity*leverage)
-            strategy.exit("Close_" + str.tostring(orderNumber), "Short_" + str.tostring(orderNumber), stop=close+(close-ma_base))
-            alert(LicenseID+',sell,' + syminfo.ticker + ',sl=' +str.tostring(close+(close-ma_base))+ ',risk='+str.tostring(quantity*leverage), alert.freq_once_per_bar_close)
+            buyStopLoss := use_fixed_stop ? close - (fixed_stop * close)/100 : close - ((ma_base-close)/ratio)
+            strategy.entry("BuyM_" + str.tostring(orderNumber), strategy.long, qty=quantity*leverage)
+            risk = calculate_stop_loss_percentage(balance, quantity*leverage, close, buyStopLoss)
+            alert(LicenseID+','+buyAlert+',' + syminfo.ticker + ',price=' + str.tostring(open) + ',sl=' +str.tostring(buyStopLoss)+ ',risk='+str.tostring(risk), alert.freq_once_per_bar_close)
+            if use_mirror_stoploss
+                strategy.exit("CloseShortM_" + str.tostring(orderNumber), "BuyM_" + str.tostring(orderNumber), stop=buyStopLoss)
             orderNumber := orderNumber + 1
         long_entry_price := close - (percent_value * close) * mirror_order_multiplier
     short_entry_price := close + percent_value * close
@@ -158,12 +189,13 @@ if ((strategy.position_size < 0 and close_base_short_condition and close_hull_sh
     current_multiplier := multiplier
     orderNumber := 0
 
-
 // Plot entry prices
-plot(use_env_plot ? long_entry_price : na, title="Long Entry Price", color=color.green, linewidth=2)
-plot(use_env_plot ? short_entry_price : na, title="Short Entry Price", color=color.red, linewidth=2)
+plot(use_env_plot ? long_entry_price : na, title="Long Entry Price", color=color.gray, linewidth=2)
+plot(use_env_plot ? short_entry_price : na, title="Short Entry Price", color=color.gray, linewidth=2)
 
 // Tracer les moyennes mobiles
 plot(use_base_plot ? hull : na, color=color.purple, linewidth=2, title="Hull 309")
 plot(use_base_plot ? ma_base : na, color=color.orange, linewidth=2, title="Hull 309")
 
+plot(use_stop_plot ? sellStopLoss: na, title="Short Entry Price", color=color.red, linewidth=2)
+plot(use_stop_plot ? buyStopLoss: na, title="Short Entry Price", color=color.green, linewidth=2)
